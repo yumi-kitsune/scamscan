@@ -3,7 +3,10 @@ import json
 import os
 import subprocess
 import sys
-from typing import Iterable, List, Tuple
+import csv
+import tempfile
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional
 
 # 📦 --- Package Installer Helper ---
 def ensure_packages():
@@ -33,11 +36,14 @@ ensure_packages()
 import requests
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat
+from telethon.tl import functions
+from telethon.errors.rpcerrorlist import FloodWaitError, UsernameNotOccupiedError, UsernameInvalidError
 
 # --- Config ---
 CONFIG_FILE = 'config.json'
 SESSION_NAME = 'userbot_session'
 SCAMMER_API = 'https://countersign.chat/api/scammer_ids.json'
+IMMUNIZE_CHANNEL = '@scamtrackingCSV'
 
 # --- API Key Setup ---
 def setup_api_credentials():
@@ -83,7 +89,6 @@ def load_scammer_ids(api_url=SCAMMER_API):
 
 # --- Formatting helpers ---
 def name_for_user(user) -> str:
-    # Prefer @username, fall back to "First Last" or "Unknown"
     if getattr(user, "username", None):
         return f"@{user.username}"
     full = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -100,15 +105,12 @@ async def send_report(client: TelegramClient, mode: int, chat, report_text: str)
     mode 2: DM Saved Messages (me)
     mode 3: Send to the chat where scammers were found
     """
-    # Mode 2
     if mode == 2:
         try:
             await client.send_message("me", report_text)
-            await asyncio.sleep(4)  # gentle pacing
+            await asyncio.sleep(4)
         except Exception as e:
             print(f"❌ Failed to DM Saved Messages: {e}")
-
-    # Mode 3
     elif mode == 3:
         try:
             await client.send_message(chat, report_text)
@@ -118,10 +120,6 @@ async def send_report(client: TelegramClient, mode: int, chat, report_text: str)
 
 # --- Chat scanning ---
 async def dialogs_matching(client: TelegramClient, chat_name: str):
-    """
-    Returns a list of entities (Channel/Chat/User) matching the given name.
-    If chat_name is empty, returns all dialogs that are Chat or Channel (skips one-on-one users).
-    """
     print("⏳ Fetching your Telegram dialogs... please wait.")
     dialogs = await client.get_dialogs()
     print(f"✅ Found {len(dialogs)} total dialogs.")
@@ -138,8 +136,7 @@ async def dialogs_matching(client: TelegramClient, chat_name: str):
         for d in dialogs:
             ent = d.entity
             if isinstance(ent, (Channel, Chat)) and getattr(ent, "title", None):
-                title = ent.title
-                if needle in title.lower():
+                if needle in ent.title.lower():
                     matches.append(ent)
 
         if not matches:
@@ -155,7 +152,6 @@ async def scan_chat_for_scammers(client: TelegramClient, chat, scammer_ids: set,
 
     try:
         print(f"⏳ Getting participant list for '{chat_title}'...")
-        # You can tune limit if needed; Telethon paginates internally.
         participants = await client.get_participants(chat)
     except Exception as e:
         print(f"❌ Could not retrieve participants for '{chat_title}': {e}")
@@ -171,10 +167,7 @@ async def scan_chat_for_scammers(client: TelegramClient, chat, scammer_ids: set,
         print(f"🚨 Known scammer(s) found in '{chat_title}':")
         for uid, username in scammers_found:
             print(f"    ⚠️ User ID: {uid}, Username: {username}")
-
-        # Build a single consolidated message per chat
         report = format_scammer_report(chat_title, scammers_found)
-        # Always console; additional send depends on mode
         await send_report(client, report_mode, chat, report)
     else:
         print(f"✅ No scammers found in '{chat_title}'.")
@@ -188,19 +181,166 @@ async def check_chats_for_scammers(client: TelegramClient, chat_name: str, scamm
     for idx, chat in enumerate(matching_chats, 1):
         print(f"[{idx}/{len(matching_chats)}]")
         await scan_chat_for_scammers(client, chat, scammer_ids, report_mode)
-        # Light pacing to be nice to Telegram servers
         await asyncio.sleep(0.2)
+
+# --- Immunize mode (block recent scammer usernames from CSV channel) ---
+def _looks_like_csv_filename(name: Optional[str]) -> bool:
+    return bool(name) and name.lower().endswith(".csv")
+
+async def fetch_latest_csv_from_channel(client: TelegramClient, channel_username: str) -> str:
+    """
+    Finds the most recent message (or near-most-recent) in the channel that has a CSV attached.
+    Downloads it and returns the local filepath.
+    """
+    channel = await client.get_entity(channel_username)
+    msgs = await client.get_messages(channel, limit=10)
+
+    chosen = None
+    for m in msgs:
+        if not m:
+            continue
+        # Look for document name ending in .csv
+        if getattr(m, "file", None) and _looks_like_csv_filename(getattr(m.file, "name", None)):
+            chosen = m
+            break
+        # Sometimes name isn't set; fall back to mime-type
+        if getattr(m, "document", None) and getattr(m.document, "mime_type", "") == "text/csv":
+            chosen = m
+            break
+
+    if not chosen:
+        raise RuntimeError("No recent CSV attachment found in the last 10 messages.")
+
+    tmpdir = tempfile.mkdtemp(prefix="immunize_")
+    out_path = os.path.join(tmpdir, getattr(chosen.file, "name", None) or "scamtracking.csv")
+    print(f"⬇️ Downloading CSV from {channel_username} to: {out_path}")
+    downloaded = await chosen.download_media(file=out_path)
+    if not downloaded or not os.path.exists(downloaded):
+        raise RuntimeError("CSV download failed.")
+    return downloaded
+
+def parse_to_block_usernames(csv_path: str) -> List[str]:
+    """
+    CSV columns: user_id, username, last_username_check
+    Include username if:
+      - last_username_check is within 1 day of now
+      - username not in {"DELETED", "None", "", None}
+    """
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=1)
+
+    to_block = []
+    seen = set()
+
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        # Normalize headers just in case
+        fieldnames = [h.strip() for h in (reader.fieldnames or [])]
+        if not {"user_id", "username", "last_username_check"}.issubset(set(fieldnames)):
+            raise ValueError(f"CSV missing required columns. Found headers: {fieldnames}")
+
+        for row in reader:
+            username = (row.get("username") or "").strip()
+            last_check = (row.get("last_username_check") or "").strip()
+
+            if username in ("", "DELETED", "None"):
+                continue
+
+            try:
+                dt = datetime.fromisoformat(last_check)
+            except Exception:
+                # If a row has a weird timestamp, skip it (don’t accidentally block stale/unknown data)
+                continue
+
+            # Treat naive times as UTC
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(tz=None).replace(tzinfo=None)
+
+            if dt < cutoff:
+                continue
+
+            if not username.startswith("@"):
+                username = "@" + username
+
+            if username.lower() not in seen:
+                seen.add(username.lower())
+                to_block.append(username)
+
+    return to_block
+
+async def block_usernames_slowly(client: TelegramClient, usernames: List[str], delay_seconds: int = 30):
+    """
+    Tries to block each username, one every delay_seconds seconds.
+    """
+    if not usernames:
+        print("✅ No usernames qualified for blocking (recent + non-deleted).")
+        return
+
+    print(f"🛡️ Immunize mode: {len(usernames)} username(s) to block.")
+    print(f"⏱️ Blocking cadence: 1 every {delay_seconds} seconds.\n")
+
+    for idx, uname in enumerate(usernames, 1):
+        print(f"[{idx}/{len(usernames)}] 🚫 Blocking {uname} ...")
+        try:
+            ent = await client.get_entity(uname)
+            await client(functions.contacts.BlockRequest(id=ent))
+            print(f"   ✅ Blocked {uname}")
+        except FloodWaitError as e:
+            print(f"   ⏳ FloodWait: sleeping {e.seconds}s then continuing...")
+            await asyncio.sleep(e.seconds)
+        except (UsernameNotOccupiedError, UsernameInvalidError):
+            print(f"   ⚠️ Username not resolvable/invalid: {uname} (skipping)")
+        except Exception as e:
+            print(f"   ❌ Failed to block {uname}: {e}")
+
+        if idx < len(usernames):
+            await asyncio.sleep(delay_seconds)
+
+async def immunize_against_scammers(client: TelegramClient):
+    """
+    1) Look up @scamtrackingCSV
+    2) Download most recent attached CSV
+    3) Parse usernames with last_username_check within 1 day, excluding DELETED/None
+    4) Block them one every 30 seconds
+    """
+    print(f"🛡️ Immunize mode selected.")
+    print(f"📥 Source channel: {IMMUNIZE_CHANNEL}")
+    try:
+        csv_path = await fetch_latest_csv_from_channel(client, IMMUNIZE_CHANNEL)
+    except Exception as e:
+        print(f"❌ Could not fetch CSV: {e}")
+        return
+
+    try:
+        usernames = parse_to_block_usernames(csv_path)
+    except Exception as e:
+        print(f"❌ Could not parse CSV: {e}")
+        return
+
+    await block_usernames_slowly(client, usernames, delay_seconds=30)
 
 # --- Main ---
 async def main():
     api_id, api_hash = setup_api_credentials()
-
     client = TelegramClient(SESSION_NAME, api_id, api_hash)
     await client.start()
-    
+
+    print("\nSelect a function:")
+    print("  1) Scan chats for known scammers (Countersign API)")
+    print("  2) Immunize (block recent scammer usernames from @scamtrackingCSV)")
+    choice = input("Enter 1 / 2: ").strip()
+
+    if choice == "2":
+        await immunize_against_scammers(client)
+        await client.disconnect()
+        input("\n✅ Done! Press Enter to exit...")
+        return
+
+    # Default: Scan mode
     scammer_ids = load_scammer_ids()
     if not scammer_ids:
         print("⚠️ No scammer IDs loaded. Please check the API.")
+        await client.disconnect()
         return
 
     print("🔎 Enter the chat name (or partial name) to scan.")

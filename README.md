@@ -13,19 +13,33 @@ This script uses **Telethon** to automatically check all (or specific) Telegram 
 2. **Console + Saved Messages (DM)**  
 3. **Console + post results in chat where scammers were found**
 
+🛡️ **Immunize mode (NEW)**  
+- Automatically blocks recently-active scam accounts from contacting your userbot  
+- Pulls the most recent CSV from **@scamtrackingCSV**  
+- Only blocks usernames that:
+  - Were checked within the last **24 hours**
+  - Are **not** marked as `DELETED` or `None`
+- Blocks **one account every 30 seconds** to reduce rate-limit risk
+
 ✅ Always prints clear console output  
 ✅ Safe credential handling (stored once in `config.json`)  
-✅ Attempts to honor telegram rate limits
+✅ Attempts to honor Telegram rate limits  
 
 ---
 
 ## NOTICE
 
-This program makes use of a feature of Telegram called a 'Userbot' where your account is used to perform the scans.
+This program makes use of a feature of Telegram called a **userbot**, where *your own account* is used to perform scans and actions.
 
-Userbots are not really addressed under Telegrams TOS. While we have not had any issues using this program we can't guarentee this wont make Telegram limit your account.
+Userbots are not explicitly addressed under Telegram’s Terms of Service.  
+While we have not experienced issues using this tool, **there is no guarantee** Telegram will not rate-limit or restrict your account.
 
-Running a single chat at a time and outputting to console only is the safest method.
+**Risk guidance:**
+- Scanning a **single chat**
+- Using **console-only output**
+- Avoiding aggressive actions
+
+…are the safest ways to run this program.
 
 ---
 
@@ -37,7 +51,8 @@ Running a single chat at a time and outputting to console only is the safest met
 
 The script automatically checks for and installs missing packages.
 
-Python can be downloaded at [https://www.python.org/downloads/](https://www.python.org/downloads/)
+Python can be downloaded at:  
+https://www.python.org/downloads/
 
 ---
 
@@ -58,7 +73,13 @@ Python can be downloaded at [https://www.python.org/downloads/](https://www.pyth
 
 ## Usage
 
-When launched, the script will:
+When launched, the script first asks which function you want to run:
+1. Scan chats for known scammers
+2. Immunize (block recent scammer usernames)
+
+---
+
+### Mode 1: Scan Chats for Scammers
 
 1. Fetch the latest scammer ID list
 2. Prompt you for a **chat name** to scan:
@@ -75,6 +96,28 @@ When launched, the script will:
    ```
 
 4. Watch progress in your console as each chat is scanned.
+
+---
+
+### Mode 2: Immunize Against Scammers (NEW)
+
+This mode proactively **blocks known scam accounts** from contacting you, based on the latest CSV published in **@scamtrackingCSV**.
+
+**What it does:**
+1. Looks up the channel: `@scamtrackingCSV`
+2. Loads the **most recent message** and looks for an attached **CSV**
+3. Downloads the CSV and reads the columns:
+- `user_id`
+- `username`
+- `last_username_check`
+4. Builds a “to block” list:
+- Includes entries where `last_username_check` is within the last **24 hours**
+- Excludes rows where `username` is `DELETED` or `None`
+5. Blocks users **one every 30 seconds** to reduce the risk of triggering Telegram rate limits.
+
+**Notes:**
+- Blocking is performed on **your account** (the userbot session you logged in with).
+- If a username no longer resolves, it will be skipped and the script continues.
 
 ---
 

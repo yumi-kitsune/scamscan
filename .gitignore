@@ -1,3 +1,4 @@
 config.json
 userbot_session.session
 *.session-journal
+overwatch_state.json

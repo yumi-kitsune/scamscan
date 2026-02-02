@@ -1,5 +1,5 @@
-__version__ = "0.3.4"
-__force__ = True
+__version__ = "0.3.5"
+__force__ = False
 ## Version info. Force should force existing clients to exit.
 
 import asyncio
@@ -218,9 +218,9 @@ def fetch_remote_script_text(url: str) -> Optional[str]:
     """
     try:
         r = requests.get(
-            url,
+            url + "?" + str(time.time()),
             timeout=15,
-            headers={"User-Agent": "ScamScan-Overwatch"},
+            headers={"User-Agent": "ScamScan-Overwatch", 'Cache-Control': 'no-cache'},
         )
         if r.status_code != 200:
             return None

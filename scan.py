@@ -37,7 +37,6 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Channel, Chat
 from telethon.tl import functions
 from telethon.errors.rpcerrorlist import FloodWaitError, UsernameNotOccupiedError, UsernameInvalidError
-from telethon import utils as tl_utils
 
 # --- Config ---
 CONFIG_FILE = 'config.json'
@@ -249,10 +248,8 @@ async def check_chats_for_scammers(
         print(f"[{idx}/{len(matching_chats)}]")
         await scan_chat_for_scammers(client, chat, scammer_ids, scammer_map, report_mode)
         await asyncio.sleep(0.2)
-        
 
 # --- Immunize mode (block scammers via usernames from unified API v2) ---
-
 def build_usernames_to_block_from_v2(
     scammer_ids: Set[str],
     scammer_map: Dict[str, Dict[str, Any]]
@@ -284,10 +281,8 @@ def build_usernames_to_block_from_v2(
         seen.add(key)
         out.append(u)
 
-    # Optional: stable ordering (alphabetical) to be deterministic
     out.sort(key=lambda x: x.lower())
     return out
-
 
 async def block_usernames_slowly(client: TelegramClient, usernames: List[str], delay_seconds: int = 30):
     """
@@ -317,7 +312,6 @@ async def block_usernames_slowly(client: TelegramClient, usernames: List[str], d
         if idx < len(usernames):
             await asyncio.sleep(delay_seconds)
 
-
 async def immunize_against_scammers(
     client: TelegramClient,
     scammer_ids: Set[str],
@@ -330,13 +324,10 @@ async def immunize_against_scammers(
     """
     print("🛡️ Immunize mode selected (using unified API v2 usernames).")
     usernames = build_usernames_to_block_from_v2(scammer_ids, scammer_map)
-
-    # If you want visibility into how many got filtered out:
     print(f"🧾 Usernames extracted from v2: {len(usernames)} (ignored None/DELETED/etc.)\n")
-
     await block_usernames_slowly(client, usernames, delay_seconds=30)
 
-# --- Overwatch mode (passive monitoring) ---
+# --- Overwatch mode helpers ---
 def _internal_id_from_peer(chat_id: int) -> str:
     s = str(chat_id)
     if s.startswith("-100"):
@@ -424,13 +415,11 @@ async def _send_saved_message_reminder_in_xm(client: TelegramClient, text: str):
     except Exception as e:
         print(f"❌ Failed to schedule Saved Messages reminder: {e}")
 
-# --- Overwatch auto-refresh helpers (12h) ---
-
+# --- Overwatch auto-refresh helpers ---
 OVERWATCH_DIALOG_REFRESH_SECONDS = 12 * 60 * 60  # 12 hours
 OVERWATCH_SCAMMER_REFRESH_SECOND = 60 * 60  # 1 hour
 
 async def _refresh_scammer_data_periodically(
-    client: TelegramClient,
     state: Dict[str, Any],
     state_lock: asyncio.Lock,
     stop_event: asyncio.Event,
@@ -443,7 +432,7 @@ async def _refresh_scammer_data_periodically(
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=refresh_seconds)
-            break  # stop requested
+            break
         except asyncio.TimeoutError:
             pass
 
@@ -461,7 +450,6 @@ async def _refresh_scammer_data_periodically(
             print(f"✅ Overwatch refresh: updated scammer list: {len(new_ids)} scammers.")
         except Exception as e:
             print(f"❌ Overwatch refresh: failed to update scammer list: {e}")
-
 
 async def _refresh_allowlist_periodically(
     client: TelegramClient,
@@ -489,6 +477,49 @@ async def _refresh_allowlist_periodically(
         except Exception as e:
             print(f"❌ Overwatch refresh: failed to update allowlist: {e}")
 
+# --- NEW: Overwatch life-check (restart if no messages in 4h) ---
+OVERWATCH_LIFE_CHECK_SECONDS = 5 * 60          # check every 5 minutes
+OVERWATCH_NO_MESSAGE_RESTART_SECONDS = 4 * 60 * 60  # 4 hours
+
+async def _life_check_periodically(
+    state: Dict[str, Any],
+    state_lock: asyncio.Lock,
+    stop_event: asyncio.Event,
+    refresh_seconds: int = OVERWATCH_LIFE_CHECK_SECONDS,
+    no_msg_seconds: int = OVERWATCH_NO_MESSAGE_RESTART_SECONDS,
+):
+    """
+    If no messages (from anyone) have been seen in no_msg_seconds, request restart.
+    We only track NewMessage events (messages), as requested.
+    """
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=refresh_seconds)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        now = time.time()
+        async with state_lock:
+            last_msg_ts = state.get("last_message_ts", None)
+            restarting = state.get("restart_requested", False)
+
+        if restarting:
+            return
+
+        if last_msg_ts is None:
+            # Haven't seen any message since starting; don't immediately restart.
+            continue
+
+        idle = now - float(last_msg_ts)
+        if idle >= no_msg_seconds:
+            async with state_lock:
+                # double-check inside lock
+                if not state.get("restart_requested", False):
+                    state["restart_requested"] = True
+            print(f"🧯 LIFE CHECK: no messages seen for {idle/3600:.2f} hours. Requesting restart...")
+            stop_event.set()
+            return
 
 # --- Overwatch mode (passive monitoring) ---
 async def overwatch_mode(
@@ -500,13 +531,16 @@ async def overwatch_mode(
     """
     overwatch_report_mode:
       1) terminal only
-      2) terminal + Saved Messages (scheduled reminder in 2 minutes)
+      2) terminal + Saved Messages (scheduled reminder in 5 minutes)
       3) terminal + Saved Messages (scheduled) + also send to the group (rate-limited per scammer per group per day)
 
     - Every 12 hours, refresh:
       - dialogs
     -- Every hour, refresh:
       - scammer list
+
+    Life-check:
+      - if no NewMessage events in 4 hours => restart process
     """
     print("🛰️ Overwatch mode enabled.")
     print("   - Listening for scammer messages and join/leave events")
@@ -516,7 +550,7 @@ async def overwatch_mode(
     print(f"   - Mode: {overwatch_report_mode} "
           f"({'terminal only' if overwatch_report_mode == 1 else 'terminal + saved messages' if overwatch_report_mode == 2 else 'terminal + saved + group'})")
     if overwatch_report_mode in (2, 3):
-        print("   - Saved Messages are sent as a scheduled reminder (2 minutes in the future) to ping you.\n")
+        print("   - Saved Messages are sent as a scheduled reminder (5 minutes in the future) to ping you.\n")
     else:
         print()
 
@@ -524,9 +558,11 @@ async def overwatch_mode(
     state_lock = asyncio.Lock()
     stop_event = asyncio.Event()
     state: Dict[str, Any] = {
-        "allowlist": set(),            # Set[int]
+        "allowlist": set(),               # Set[int]
         "scammer_ids": set(scammer_ids),  # Set[str]
         "scammer_map": dict(scammer_map), # Dict[str, Dict[str, Any]]
+        "last_message_ts": None,          # float timestamp
+        "restart_requested": False,       # bool
     }
 
     print("Reading groups...")
@@ -535,13 +571,14 @@ async def overwatch_mode(
         state["allowlist"] = initial_allowlist
     print(f"✅ Overwatch allowlist ready: {len(initial_allowlist)} chat(s) with >2 users.\n")
 
-    # Start periodic refresh tasks
+    # Start periodic tasks
     refresh_tasks = [
         asyncio.create_task(_refresh_allowlist_periodically(client, state, state_lock, stop_event)),
-        asyncio.create_task(_refresh_scammer_data_periodically(client, state, state_lock, stop_event)),
+        asyncio.create_task(_refresh_scammer_data_periodically(state, state_lock, stop_event)),
+        asyncio.create_task(_life_check_periodically(state, state_lock, stop_event)),
     ]
 
-    # Soft dedupe to avoid tight repeats (terminal + optional sends)
+    # Soft dedupe to avoid tight repeats
     last_notified: Dict[Tuple[str, int, str, str], float] = {}
     DEDUPE_SECONDS = 30.0
 
@@ -570,7 +607,7 @@ async def overwatch_mode(
     async def notify(kind: str, chat_entity, chat_id: int, uid_str: str, extra_key: str, text: str):
         """
         Applies a short dedupe; then:
-          - mode 2/3: schedule reminder to Saved Messages (2 min)
+          - mode 2/3: schedule reminder to Saved Messages (5 min)
           - mode 3: attempt send to group once/day per (chat,scammer)
         """
         key = (kind, chat_id, uid_str, extra_key)
@@ -603,8 +640,8 @@ async def overwatch_mode(
             return
 
         still = await _is_user_still_in_chat_via_common_chats(client, uid_int, chat_id)
-
         topic_line = f"• Scammer topic: {scammer_topic}\n" if scammer_topic else ""
+
         if still is True:
             text = (
                 f"✅ **Scammer joined chat**\n"
@@ -617,7 +654,6 @@ async def overwatch_mode(
             await notify("verify", chat_entity, chat_id, uid_str, "still", text)
 
         elif still is False:
-            pass
             print(f"⚠️ Overwatch verify: gone from '{chat_title}': {scammer_display} ({uid_str})")
 
         else:
@@ -627,11 +663,16 @@ async def overwatch_mode(
                 f"• Chat link: {chat_link}\n"
                 f"• Scammer: {scammer_display} (id `{uid_str}`)\n"
                 f"{topic_line}"
-            )
+            ).rstrip()
             print(f"ℹ️ Overwatch verify: inconclusive (but likely in) for '{chat_title}': {scammer_display} ({uid_str})")
+            await notify("verify", chat_entity, chat_id, uid_str, "unknown", text)
 
     @client.on(events.NewMessage())
     async def on_new_message(event: events.NewMessage.Event):
+        # NEW: life-check heartbeat (any message from anyone, any chat)
+        async with state_lock:
+            state["last_message_ts"] = time.time()
+
         chat_id = event.chat_id
         if chat_id is None:
             return
@@ -664,15 +705,10 @@ async def overwatch_mode(
 
         chat_title = getattr(chat_entity, "title", None) or "(unknown chat)"
         msg_link = _chat_link_for_message(chat_entity, chat_id, event.message.id)
-        chat_link = _chat_link(chat_entity, chat_id)
 
         info = scammer_map_local.get(uid_str, {})
         scammer_display = scammer_display_name_from_v2(info) if info else name_for_telegram_user_fallback(sender)
         scammer_topic = topic_link_for_scammer(info) if info else None
-
-        msg_preview = (event.raw_text or "").strip()
-        if len(msg_preview) > 400:
-            msg_preview = msg_preview[:400] + "…"
 
         topic_line = f"• Scammer topic: {scammer_topic}\n" if scammer_topic else ""
         text = (
@@ -681,8 +717,8 @@ async def overwatch_mode(
             f"• Scammer: {scammer_display} (id `{uid_str}`)\n"
             f"{topic_line}"
             f"• Message link: {msg_link}"
-            #f"Message:\n{msg_preview if msg_preview else '(no text)'}"
         )
+
         print(f"🚨 Overwatch: scammer message in '{chat_title}' by {scammer_display} ({uid_str}) -> {msg_link}")
         await notify("msg", chat_entity, chat_id, uid_str, str(event.message.id), text)
 
@@ -734,7 +770,6 @@ async def overwatch_mode(
         topic_line = f"• Scammer topic: {scammer_topic}\n" if scammer_topic else ""
 
         action = "joined" if joined else "left"
-
         text = (
             f"🚨 **Scammer {action} detected**\n"
             f"• Chat: **{chat_title}** (`{chat_id}`)\n"
@@ -744,7 +779,6 @@ async def overwatch_mode(
         ).rstrip()
 
         print(f"🚨 Overwatch: scammer {action} in '{chat_title}': {scammer_display} ({uid_str})")
-        await notify("action", chat_entity, chat_id, uid_str, action, text)
 
         if joined:
             asyncio.create_task(delayed_join_verify(
@@ -759,12 +793,16 @@ async def overwatch_mode(
 
     print("🟢 Overwatch is running. Press Ctrl+C to stop.\n")
 
+    restart_requested = False
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:
         print("\n🛑 Overwatch stopping (Ctrl+C).")
     finally:
-        # stop periodic refresh tasks
+        # stop periodic tasks
+        async with state_lock:
+            restart_requested = bool(state.get("restart_requested", False))
+
         stop_event.set()
         for t in refresh_tasks:
             t.cancel()
@@ -774,6 +812,11 @@ async def overwatch_mode(
             await client.disconnect()
         except Exception:
             pass
+
+    # If life-check requested restart: execv the current script
+    if restart_requested:
+        print("🔁 Restarting process via execv...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # --- Main ---
 async def main():
@@ -803,7 +846,7 @@ async def main():
     if choice == "3":
         print("\n📣 Overwatch reporting mode:")
         print("  1) Terminal only")
-        print("  2) Terminal + Saved Messages (scheduled reminder in 2 min)")
+        print("  2) Terminal + Saved Messages (scheduled reminder in 5 min)")
         print("  3) Terminal + Saved Messages (scheduled) + send to group (limited: 1 alert per scammer per group per day)")
         ow_raw = input("Enter 1 / 2 / 3: ").strip()
         try:

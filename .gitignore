@@ -1,2 +1,3 @@
 config.json
 userbot_session.session
+*.session-journal

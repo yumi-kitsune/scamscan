@@ -1,3 +1,7 @@
+__version__ = "0.3.0"
+__force__ = False
+## Version info. Force should force existing clients to exit.
+
 import asyncio
 import json
 import os
@@ -45,6 +49,11 @@ CONFIG_FILE = 'config.json'
 SESSION_NAME = 'userbot_session'
 SCAMMER_API_V2 = 'https://countersign.chat/api/scammer_ids_v2.json'
 SCAMMER_TOPIC_BASE = "https://t.me/scamtrackinglist"
+
+GITHUB_OWNER = "yumi-kitsune"
+GITHUB_REPO = "scamscan"
+GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/{GITHUB_SCRIPT_PATH}"
+UPDATE_CHECK_SECONDS = 2 * 60 * 60  # 2 hours
 
 # --- API Key Setup ---
 def setup_api_credentials():
@@ -166,6 +175,157 @@ async def send_report(client: TelegramClient, mode: int, chat, report_text: str)
             await asyncio.sleep(2)
         except Exception as e:
             print(f"❌ Failed to send message to chat '{getattr(chat, 'title', chat)}': {e}")
+
+# --- Github Auto Update ---
+_VERSION_RE = re.compile(r'^\s*__version__\s*=\s*["\']([^"\']+)["\']\s*$', re.MULTILINE)
+_FORCE_RE   = re.compile(r'^\s*__force__\s*=\s*(True|False)\s*$', re.MULTILINE)
+
+def _parse_version(v: str):
+    """
+    Semver-ish: '0.3.0' -> (0,3,0). Accepts 'v0.3.0' too.
+    Non-digits ignored; missing parts default to 0.
+    """
+    v = (v or "").strip()
+    if v.lower().startswith("v"):
+        v = v[1:]
+    parts = re.split(r"[^\d]+", v)
+    nums = [int(p) for p in parts if p.isdigit()]
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+def _is_remote_newer(remote: str, local: str) -> bool:
+    return _parse_version(remote) > _parse_version(local)
+
+def _extract_remote_version_and_force(py_text: str) -> tuple[Optional[str], Optional[bool]]:
+    """
+    Extract __version__ and __force__ from script text via regex (no exec).
+    """
+    if not py_text:
+        return None, None
+
+    m_ver = _VERSION_RE.search(py_text)
+    m_for = _FORCE_RE.search(py_text)
+
+    remote_version = m_ver.group(1).strip() if m_ver else None
+    remote_force = (m_for.group(1) == "True") if m_for else None
+    return remote_version, remote_force
+
+def fetch_remote_script_text(url: str) -> Optional[str]:
+    """
+    Downloads the raw script text. Returns None on failure.
+    """
+    try:
+        r = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "ScamScan-Overwatch"},
+        )
+        if r.status_code != 200:
+            return None
+        return r.text
+    except Exception:
+        return None
+
+def check_for_update_once(
+    local_version: str,
+    local_force: bool,
+    raw_url: str,
+    *,
+    print_prefix: str = "🔎 Update check",
+) -> dict:
+    """
+    Checks remote scan.py for __version__/__force__.
+    Always returns a dict describing status.
+    May call sys.exit if remote has force=True and local is behind.
+    """
+    result = {
+        "ok": False,
+        "local_version": local_version,
+        "local_force": local_force,
+        "remote_version": None,
+        "remote_force": None,
+        "update_available": False,
+        "forced_update_required": False,
+        "error": None,
+        "url": raw_url,
+    }
+
+    text = fetch_remote_script_text(raw_url)
+    if not text:
+        result["error"] = "fetch_failed"
+        print(f"{print_prefix}: ⚠️ unable to fetch remote version info ({raw_url})")
+        return result
+
+    remote_version, remote_force = _extract_remote_version_and_force(text)
+    result["remote_version"] = remote_version
+    result["remote_force"] = remote_force
+
+    if not remote_version:
+        result["error"] = "parse_failed"
+        print(f"{print_prefix}: ⚠️ fetched remote file but couldn't parse __version__")
+        return result
+
+    result["ok"] = True
+    update_available = _is_remote_newer(remote_version, local_version)
+    result["update_available"] = update_available
+
+    forced_required = bool(update_available and (remote_force is True))
+    result["forced_update_required"] = forced_required
+
+    # You asked: "post a message in the terminal noting it every time the 2 hour cycle runs."
+    # So print a line *every time*.
+    if update_available:
+        force_note = " (FORCED)" if forced_required else ""
+        print(f"{print_prefix}: ⬆️ update available{force_note} — local={local_version} remote={remote_version} force={remote_force}")
+    else:
+        print(f"{print_prefix}: ✅ up to date — local={local_version} remote={remote_version} force={remote_force}")
+
+    # If remote requires force update, refuse to run
+    if forced_required:
+        print("\n🛑 This version is blocked by upstream __force__.")
+        print(f"   • Your version:  {local_version}")
+        print(f"   • Required:      {remote_version}")
+        print(f"   • Update from:   {raw_url}\n")
+        sys.exit(3)
+
+    return result
+
+async def periodic_update_checker(
+    stop_event: asyncio.Event,
+    *,
+    local_version: str,
+    local_force: bool,
+    raw_url: str,
+    interval_seconds: int,
+):
+    """
+    Runs update checks every interval_seconds until stop_event is set.
+    Uses asyncio.to_thread to keep requests off the event loop.
+    """
+    # Check immediately on start of this task too (optional but useful)
+    await asyncio.to_thread(
+        check_for_update_once,
+        local_version,
+        local_force,
+        raw_url,
+        print_prefix="🔎 Update check (periodic)",
+    )
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        await asyncio.to_thread(
+            check_for_update_once,
+            local_version,
+            local_force,
+            raw_url,
+            print_prefix="🔎 Update check (periodic)",
+        )
 
 # --- Chat scanning ---
 async def dialogs_matching(client: TelegramClient, chat_name: str):
@@ -833,7 +993,8 @@ async def overwatch_mode(
         asyncio.create_task(_refresh_allowlist_periodically(client, state, state_lock, stop_event)),
         asyncio.create_task(_refresh_scammer_data_periodically(state, state_lock, stop_event)),
         asyncio.create_task(_life_check_periodically(state, state_lock, stop_event)),
-        asyncio.create_task(_persist_overwatch_state_periodically(state, state_lock, stop_event))
+        asyncio.create_task(_persist_overwatch_state_periodically(state, state_lock, stop_event)),
+        asyncio.create_task(periodic_update_checker(stop_event, local_version=__version__, local_force=__force__, raw_url=GITHUB_RAW_URL, interval_seconds=UPDATE_CHECK_SECONDS)),
     ]
 
     DEDUPE_SECONDS = 30.0
@@ -849,7 +1010,9 @@ async def overwatch_mode(
         try:
             msg = await client.send_message(chat_entity, text)
             group_last_sent[key] = now
+
             return msg
+
         except FloodWaitError as e:
             print(f"   ⏳ FloodWait while sending to group: sleeping {e.seconds}s (suppressing this send)")
             await asyncio.sleep(e.seconds)
@@ -879,7 +1042,7 @@ async def overwatch_mode(
                 await _record_own_group_alert(chat_id, sent_msg, {uid_str})
             else:
                 print(f"ℹ️ Overwatch: group alert suppressed (daily limit) for scammer {uid_str} in chat {chat_id}")
-
+                
 
 
     async def delayed_join_verify(
@@ -1182,6 +1345,7 @@ async def overwatch_mode(
 
 # --- Main ---
 async def main():
+    check_for_update_once(__version__, __force__, GITHUB_RAW_URL, print_prefix="🔎 Update check (startup)")
     api_id, api_hash = setup_api_credentials()
     client = TelegramClient(SESSION_NAME, api_id, api_hash)
     await client.start()

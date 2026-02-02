@@ -52,6 +52,7 @@ SCAMMER_TOPIC_BASE = "https://t.me/scamtrackinglist"
 
 GITHUB_OWNER = "yumi-kitsune"
 GITHUB_REPO = "scamscan"
+GITHUB_SCRIPT_PATH = "scan.py"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/{GITHUB_SCRIPT_PATH}"
 UPDATE_CHECK_SECONDS = 2 * 60 * 60  # 2 hours
 

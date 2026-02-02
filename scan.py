@@ -1,5 +1,5 @@
-__version__ = "0.3.3"
-__force__ = False
+__version__ = "0.3.4"
+__force__ = True
 ## Version info. Force should force existing clients to exit.
 
 import asyncio

@@ -802,12 +802,7 @@ async def overwatch_mode(
         asyncio.create_task(_life_check_periodically(state, state_lock, stop_event)),
     ]
 
-    # Soft dedupe to avoid tight repeats
-    last_notified: Dict[Tuple[str, int, str, str], float] = {}
     DEDUPE_SECONDS = 30.0
-
-    # Hard rate-limit for group sending (mode 3): 1 alert per scammer per group per day
-    group_last_sent: Dict[Tuple[int, str], float] = {}
     GROUP_LIMIT_SECONDS = 86400.0  # 1 day
 
     async def maybe_send_to_group_with_daily_limit(chat_entity, chat_id: int, uid_str: str, text: str) -> bool:

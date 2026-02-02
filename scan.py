@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 import time
+import re
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Dict, Set, Any
 
@@ -415,6 +417,27 @@ async def _send_saved_message_reminder_in_xm(client: TelegramClient, text: str):
     except Exception as e:
         print(f"❌ Failed to schedule Saved Messages reminder: {e}")
 
+# --- Overwatch duplicate detection (mode 3) ---
+DUPLICATE_WINDOW_SECONDS = 10 * 60   # 10 minutes
+DUPLICATE_PRUNE_SECONDS  = 12 * 60   # prune slightly beyond window
+DUPLICATE_MARKER_EMOJI = "🚨"
+
+_UID_RE = re.compile(r"\b\d{6,}\b")  # telegram user ids are usually 7-12 digits; 6+ is a safe floor
+
+def _looks_like_scam_alert(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return (DUPLICATE_MARKER_EMOJI in text) and ("scam" in t)
+
+def _extract_uids_from_text(text: str) -> Set[str]:
+    if not text:
+        return set()
+    return set(_UID_RE.findall(text))
+
+def _now_ts() -> float:
+    return time.time()
+
 # --- Overwatch auto-refresh helpers ---
 OVERWATCH_DIALOG_REFRESH_SECONDS = 12 * 60 * 60  # 12 hours
 OVERWATCH_SCAMMER_REFRESH_SECOND = 60 * 60  # 1 hour
@@ -765,13 +788,14 @@ async def overwatch_mode(
     # Shared, refreshable state
     state_lock = asyncio.Lock()
     stop_event = asyncio.Event()
-    
-    # Shared, refreshable state
-    state_lock = asyncio.Lock()
-    stop_event = asyncio.Event()
+
 
     # Load persisted state (for manual restarts too)
     persisted = load_overwatch_state_from_disk()
+    
+    me = await client.get_me()
+    my_id = getattr(me, "id", None)
+
 
     # Soft dedupe + daily group limits (persisted)
     last_notified: Dict[Tuple[str, int, str, str], float] = dict(persisted.get("last_notified", {}))
@@ -788,6 +812,15 @@ async def overwatch_mode(
         "group_last_sent": group_last_sent,
         "last_notified": last_notified,
     }
+    
+    # For duplicate message detection: what WE posted recently per chat
+    # chat_id -> deque of entries: {"msg_id": int, "ts": float, "uids": set(str)}
+    state["own_alerts"] = defaultdict(deque)
+
+    # chat_id -> dict uid_str -> last_seen_ts (uids we alerted about recently)
+    state["own_recent_uids"] = defaultdict(dict)
+
+    state["my_id"] = my_id
 
     print("Reading groups...")
     initial_allowlist = await _build_group_allowlist(client)
@@ -800,28 +833,30 @@ async def overwatch_mode(
         asyncio.create_task(_refresh_allowlist_periodically(client, state, state_lock, stop_event)),
         asyncio.create_task(_refresh_scammer_data_periodically(state, state_lock, stop_event)),
         asyncio.create_task(_life_check_periodically(state, state_lock, stop_event)),
+        asyncio.create_task(_persist_overwatch_state_periodically(state, state_lock, stop_event))
     ]
 
     DEDUPE_SECONDS = 30.0
     GROUP_LIMIT_SECONDS = 86400.0  # 1 day
 
-    async def maybe_send_to_group_with_daily_limit(chat_entity, chat_id: int, uid_str: str, text: str) -> bool:
+    async def maybe_send_to_group_with_daily_limit(chat_entity, chat_id: int, uid_str: str, text: str):
         key = (chat_id, uid_str)
-        now = time.time()
+        now = _now_ts()
         last = group_last_sent.get(key, 0.0)
         if (now - last) < GROUP_LIMIT_SECONDS:
-            return False
+            return None
+
         try:
-            await client.send_message(chat_entity, text)
+            msg = await client.send_message(chat_entity, text)
             group_last_sent[key] = now
-            return True
+            return msg
         except FloodWaitError as e:
             print(f"   ⏳ FloodWait while sending to group: sleeping {e.seconds}s (suppressing this send)")
             await asyncio.sleep(e.seconds)
-            return False
+            return None
         except Exception as e:
             print(f"❌ Failed to send alert to group '{getattr(chat_entity, 'title', chat_entity)}': {e}")
-            return False
+            return None
 
     async def notify(kind: str, chat_entity, chat_id: int, uid_str: str, extra_key: str, text: str):
         """
@@ -839,9 +874,13 @@ async def overwatch_mode(
             await _send_saved_message_reminder_in_xm(client, text)
 
         if overwatch_report_mode == 3 and chat_entity is not None:
-            sent = await maybe_send_to_group_with_daily_limit(chat_entity, chat_id, uid_str, text)
-            if not sent:
+            sent_msg = await maybe_send_to_group_with_daily_limit(chat_entity, chat_id, uid_str, text)
+            if sent_msg:
+                await _record_own_group_alert(chat_id, sent_msg, {uid_str})
+            else:
                 print(f"ℹ️ Overwatch: group alert suppressed (daily limit) for scammer {uid_str} in chat {chat_id}")
+
+
 
     async def delayed_join_verify(
         chat_entity,
@@ -863,8 +902,8 @@ async def overwatch_mode(
 
         if still is True:
             text = (
-                f"✅ **Scammer joined chat**\n"
-                f"• Chat: **{chat_title}** (`{chat_id}`)\n"
+                f"🚨 **Scammer joined chat**\n"
+                f"• Chat: **{chat_title}**\n"
                 f"• Chat link: {chat_link}\n"
                 f"• Scammer: {scammer_display} (id `{uid_str}`)\n"
                 f"{topic_line}"
@@ -877,18 +916,120 @@ async def overwatch_mode(
 
         else:
             text = (
-                f"✅ **Scammer joined chat**\n"
-                f"• Chat: **{chat_title}** (`{chat_id}`)\n"
+                f"🚨 **Scammer joined chat**\n"
+                f"• Chat: **{chat_title}**\n"
                 f"• Chat link: {chat_link}\n"
                 f"• Scammer: {scammer_display} (id `{uid_str}`)\n"
                 f"{topic_line}"
             ).rstrip()
             print(f"ℹ️ Overwatch verify: inconclusive (but likely in) for '{chat_title}': {scammer_display} ({uid_str})")
             await notify("verify", chat_entity, chat_id, uid_str, "unknown", text)
+            
+    async def _record_own_group_alert(chat_id: int, sent_msg, uids: Set[str]):
+        """
+        Track our sent group alerts so we can delete duplicates if someone else posted earlier.
+        """
+        if not sent_msg:
+            return
+
+        ts = None
+        try:
+            ts = sent_msg.date.timestamp() if sent_msg.date else _now_ts()
+        except Exception:
+            ts = _now_ts()
+
+        async with state_lock:
+            # store per-chat alert message
+            dq = state["own_alerts"][chat_id]
+            dq.append({"msg_id": int(sent_msg.id), "ts": float(ts), "uids": set(uids)})
+
+            # store per-chat recent uids
+            uid_map = state["own_recent_uids"][chat_id]
+            for u in uids:
+                uid_map[str(u)] = float(ts)
+
+            # prune
+            cutoff = _now_ts() - DUPLICATE_PRUNE_SECONDS
+            while dq and dq[0]["ts"] < cutoff:
+                dq.popleft()
+
+            # prune uid map
+            for u, uts in list(uid_map.items()):
+                if uts < cutoff:
+                    uid_map.pop(u, None)
+                    
+    async def _handle_possible_duplicate_alert(event, chat_id: int):
+        if overwatch_report_mode != 3:
+            return
+
+        msg = event.message
+        text = (event.raw_text or "").strip()
+        if not _looks_like_scam_alert(text):
+            return
+
+        # Ignore our own outgoing messages
+        if getattr(msg, "out", False):
+            return
+
+        candidate_uids = _extract_uids_from_text(text)
+        if not candidate_uids:
+            return
+
+        try:
+            candidate_ts = msg.date.timestamp() if msg.date else _now_ts()
+        except Exception:
+            candidate_ts = _now_ts()
+
+        cutoff = _now_ts() - DUPLICATE_WINDOW_SECONDS
+        prune_cutoff = _now_ts() - DUPLICATE_PRUNE_SECONDS
+
+        async with state_lock:
+            recent_uid_map = state["own_recent_uids"][chat_id]
+            recent_uids = {u for u, uts in recent_uid_map.items() if uts >= cutoff}
+
+            overlap = candidate_uids & recent_uids
+            if not overlap:
+                return  # not confirmed
+
+            dq = state["own_alerts"][chat_id]
+
+            # prune old tracking
+            while dq and dq[0]["ts"] < prune_cutoff:
+                dq.popleft()
+            for u, uts in list(recent_uid_map.items()):
+                if uts < prune_cutoff:
+                    recent_uid_map.pop(u, None)
+
+            my_matching = [
+                a for a in dq
+                if a["ts"] >= cutoff and (a["uids"] & overlap)
+            ]
+
+        if not my_matching:
+            return
+
+        # Delete OUR messages that are newer than the candidate
+        to_delete = [a["msg_id"] for a in my_matching if a["ts"] > candidate_ts]
+        if not to_delete:
+            return
+
+        try:
+            await client.delete_messages(chat_id, to_delete, revoke=True)
+            print(f"🧹 Duplicate detector: deleted {len(to_delete)} newer duplicate alert(s) in chat {chat_id} "
+                  f"(uids={sorted(list(overlap))[:5]}{'...' if len(overlap)>5 else ''})")
+        except FloodWaitError as e:
+            print(f"   ⏳ FloodWait while deleting duplicates: sleeping {e.seconds}s")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            print(f"⚠️ Duplicate detector: failed to delete duplicates in chat {chat_id}: {e}")
+
+        async with state_lock:
+            dq = state["own_alerts"][chat_id]
+            state["own_alerts"][chat_id] = deque([a for a in dq if a["msg_id"] not in set(to_delete)])
+
 
     @client.on(events.NewMessage())
     async def on_new_message(event: events.NewMessage.Event):
-        # NEW: life-check heartbeat (any message from anyone, any chat)
         async with state_lock:
             state["last_message_ts"] = time.time()
 
@@ -896,7 +1037,6 @@ async def overwatch_mode(
         if chat_id is None:
             return
 
-        # Snapshot allowlist + scammer set
         async with state_lock:
             allowlist = state["allowlist"]
             scammer_ids_local = state["scammer_ids"]
@@ -904,6 +1044,9 @@ async def overwatch_mode(
 
         if chat_id not in allowlist:
             return
+
+        # NEW: duplicate watcher (mode 3)
+        await _handle_possible_duplicate_alert(event, chat_id)
 
         sender = await event.get_sender()
         if not sender:

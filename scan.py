@@ -1,4 +1,4 @@
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __force__ = False
 ## Version info. Force should force existing clients to exit.
 

@@ -520,6 +520,214 @@ async def _life_check_periodically(
             print(f"🧯 LIFE CHECK: no messages seen for {idle/3600:.2f} hours. Requesting restart...")
             stop_event.set()
             return
+            
+# --- Overwatch persistent state ---
+OVERWATCH_STATE_FILE = "overwatch_state.json"
+OVERWATCH_STATE_SAVE_SECONDS = 60  # save once a minute
+OVERWATCH_STATE_VERSION = 1
+
+def _encode_key(parts: List[Any]) -> str:
+    # Safe-ish separator for tuple keys
+    return "|".join(str(p).replace("|", "%7C") for p in parts)
+
+def _decode_key(s: str, n_parts: int) -> Optional[Tuple[str, ...]]:
+    try:
+        parts = s.split("|")
+        if len(parts) != n_parts:
+            return None
+        parts = tuple(p.replace("%7C", "|") for p in parts)
+        return parts
+    except Exception:
+        return None
+
+def load_overwatch_state_from_disk() -> Dict[str, Any]:
+    """
+    Returns a dict with keys:
+      - allowlist: Set[int]
+      - last_message_ts: Optional[float]
+      - group_last_sent: Dict[Tuple[int,str], float]
+      - last_notified: Dict[Tuple[str,int,str,str], float]
+    Missing/corrupt file => returns empty defaults.
+    """
+    if not os.path.exists(OVERWATCH_STATE_FILE):
+        return {
+            "allowlist": set(),
+            "last_message_ts": None,
+            "group_last_sent": {},
+            "last_notified": {},
+        }
+
+    try:
+        with open(OVERWATCH_STATE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError("state payload not a dict")
+
+        if payload.get("version") != OVERWATCH_STATE_VERSION:
+            print("⚠️ Overwatch state version mismatch; ignoring saved state.")
+            return {
+                "allowlist": set(),
+                "last_message_ts": None,
+                "group_last_sent": {},
+                "last_notified": {},
+            }
+
+        allowlist = set()
+        for x in payload.get("allowlist", []) or []:
+            try:
+                allowlist.add(int(x))
+            except Exception:
+                pass
+
+        last_message_ts = payload.get("last_message_ts", None)
+        if last_message_ts is not None:
+            try:
+                last_message_ts = float(last_message_ts)
+            except Exception:
+                last_message_ts = None
+
+        group_last_sent: Dict[Tuple[int, str], float] = {}
+        for k, v in (payload.get("group_last_sent", {}) or {}).items():
+            tup = _decode_key(str(k), 2)
+            if not tup:
+                continue
+            chat_id_s, uid_str = tup
+            try:
+                chat_id = int(chat_id_s)
+                ts = float(v)
+                group_last_sent[(chat_id, str(uid_str))] = ts
+            except Exception:
+                continue
+
+        last_notified: Dict[Tuple[str, int, str, str], float] = {}
+        for k, v in (payload.get("last_notified", {}) or {}).items():
+            tup = _decode_key(str(k), 4)
+            if not tup:
+                continue
+            kind, chat_id_s, uid_str, extra_key = tup
+            try:
+                chat_id = int(chat_id_s)
+                ts = float(v)
+                last_notified[(str(kind), chat_id, str(uid_str), str(extra_key))] = ts
+            except Exception:
+                continue
+
+        print(f"💾 Loaded overwatch state from disk: "
+              f"allowlist={len(allowlist)}, "
+              f"group_last_sent={len(group_last_sent)}, "
+              f"last_notified={len(last_notified)}, "
+              f"last_message_ts={'set' if last_message_ts else 'None'}")
+
+        return {
+            "allowlist": allowlist,
+            "last_message_ts": last_message_ts,
+            "group_last_sent": group_last_sent,
+            "last_notified": last_notified,
+        }
+
+    except Exception as e:
+        print(f"⚠️ Failed to load overwatch state; starting fresh: {e}")
+        return {
+            "allowlist": set(),
+            "last_message_ts": None,
+            "group_last_sent": {},
+            "last_notified": {},
+        }
+
+def save_overwatch_state_to_disk(
+    allowlist: Set[int],
+    last_message_ts: Optional[float],
+    group_last_sent: Dict[Tuple[int, str], float],
+    last_notified: Dict[Tuple[str, int, str, str], float],
+):
+    """
+    Writes state to OVERWATCH_STATE_FILE (overwrite, not atomic).
+    """
+    try:
+        payload = {
+            "version": OVERWATCH_STATE_VERSION,
+            "saved_at": int(time.time()),
+            "allowlist": sorted(list(allowlist)),
+            "last_message_ts": last_message_ts,
+            "group_last_sent": {
+                _encode_key([chat_id, uid_str]): ts
+                for (chat_id, uid_str), ts in group_last_sent.items()
+            },
+            "last_notified": {
+                _encode_key([kind, chat_id, uid_str, extra_key]): ts
+                for (kind, chat_id, uid_str, extra_key), ts in last_notified.items()
+            },
+        }
+        with open(OVERWATCH_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Failed to save overwatch state: {e}")
+
+async def _persist_overwatch_state_periodically(
+    state: Dict[str, Any],
+    state_lock: asyncio.Lock,
+    stop_event: asyncio.Event,
+    save_seconds: int = OVERWATCH_STATE_SAVE_SECONDS,
+):
+    """
+    Periodically snapshots state and writes it to disk.
+    """
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=save_seconds)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            async with state_lock:
+                allowlist = set(state.get("allowlist", set()))
+                last_message_ts = state.get("last_message_ts", None)
+                group_last_sent = state.get("group_last_sent", {})
+                last_notified = state.get("last_notified", {})
+
+                # shallow copy so we don't serialize while dict is mutating
+                group_last_sent_copy = dict(group_last_sent)
+                last_notified_copy = dict(last_notified)
+
+            save_overwatch_state_to_disk(
+                allowlist=allowlist,
+                last_message_ts=last_message_ts,
+                group_last_sent=group_last_sent_copy,
+                last_notified=last_notified_copy,
+            )
+        except Exception as e:
+            print(f"⚠️ Persist task error: {e}")
+
+
+async def run_overwatch_forever(api_id, api_hash, overwatch_report_mode):
+    backoff = 5
+    while True:
+        client = TelegramClient(SESSION_NAME, api_id, api_hash)
+        try:
+            await client.start()
+
+            scammer_map, scammer_ids = load_scammer_data_v2()
+            if not scammer_ids:
+                print("⚠️ No scammer data loaded; retrying soon...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+                continue
+
+            backoff = 5
+            await overwatch_mode(client, scammer_ids, scammer_map, overwatch_report_mode)
+
+        except Exception as e:
+            print(f"🔌 Overwatch crashed/disconnected: {e!r}")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+        print(f"🔁 Reconnecting in {backoff}s...")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
 
 # --- Overwatch mode (passive monitoring) ---
 async def overwatch_mode(
@@ -557,12 +765,28 @@ async def overwatch_mode(
     # Shared, refreshable state
     state_lock = asyncio.Lock()
     stop_event = asyncio.Event()
+    
+    # Shared, refreshable state
+    state_lock = asyncio.Lock()
+    stop_event = asyncio.Event()
+
+    # Load persisted state (for manual restarts too)
+    persisted = load_overwatch_state_from_disk()
+
+    # Soft dedupe + daily group limits (persisted)
+    last_notified: Dict[Tuple[str, int, str, str], float] = dict(persisted.get("last_notified", {}))
+    group_last_sent: Dict[Tuple[int, str], float] = dict(persisted.get("group_last_sent", {}))
+
     state: Dict[str, Any] = {
-        "allowlist": set(),               # Set[int]
-        "scammer_ids": set(scammer_ids),  # Set[str]
-        "scammer_map": dict(scammer_map), # Dict[str, Dict[str, Any]]
-        "last_message_ts": None,          # float timestamp
-        "restart_requested": False,       # bool
+        "allowlist": set(persisted.get("allowlist", set())),   # will be refreshed from dialogs
+        "scammer_ids": set(scammer_ids),
+        "scammer_map": dict(scammer_map),
+        "last_message_ts": persisted.get("last_message_ts", None),
+        "restart_requested": False,
+
+        # references so the persister can snapshot them
+        "group_last_sent": group_last_sent,
+        "last_notified": last_notified,
     }
 
     print("Reading groups...")
@@ -856,8 +1080,8 @@ async def main():
         if overwatch_report_mode not in (1, 2, 3):
             print("⚠️ Invalid choice. Defaulting to Overwatch mode 1 (Terminal only).")
             overwatch_report_mode = 1
-
-        await overwatch_mode(client, scammer_ids, scammer_map, overwatch_report_mode)
+        await client.disconnect()
+        await run_overwatch_forever(api_id, api_hash, overwatch_report_mode)
         return
 
     # Default: Scan mode

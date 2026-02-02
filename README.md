@@ -2,7 +2,7 @@
 
 ScamScan is a **Telethon-based userbot** that helps you detect known scam accounts across your Telegram groups.
 
-It pulls a unified scammer list from Countersign and can:
+It pulls a unified scammer list from the scamtracking api and can:
 
 - **Scan** your chats for known scammers
 - **Immunize** your account by blocking scammer usernames (slowly)
@@ -13,10 +13,6 @@ It pulls a unified scammer list from Countersign and can:
 ---
 
 ## Features
-
-✅ **Unified scammer list (v2)**
-- Source: `https://countersign.chat/api/scammer_ids_v2.json`
-- Includes metadata (topic id, reason, username/full name when available)
 
 ✅ **Scan chats**
 - Scan **all** groups/channels, or filter by partial chat name

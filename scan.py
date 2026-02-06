@@ -40,9 +40,9 @@ ensure_packages()
 # Safe to import now
 import requests
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, MessageActionChatAddUser, MessageActionChatJoinedByLink, ChannelParticipantsRecent
 from telethon.tl import functions
-from telethon.errors.rpcerrorlist import FloodWaitError, UsernameNotOccupiedError, UsernameInvalidError
+from telethon.errors.rpcerrorlist import FloodWaitError, UsernameNotOccupiedError, UsernameInvalidError, UserIdInvalidError, UserPrivacyRestrictedError
 
 # --- Config ---
 CONFIG_FILE = 'config.json'
@@ -491,6 +491,22 @@ async def immunize_against_scammers(
     await block_usernames_slowly(client, usernames, delay_seconds=30)
 
 # --- Overwatch mode helpers ---
+def _extract_action_user_ids(msg) -> list[int]:
+    """
+    Returns user IDs involved in a join/add service message, else [].
+    """
+    action = getattr(msg, "action", None)
+    if isinstance(action, MessageActionChatAddUser):
+        # action.users is a list of user IDs (ints)
+        return [int(x) for x in (action.users or [])]
+    if isinstance(action, MessageActionChatJoinedByLink):
+        # This action doesn't directly include the joiner, but the service message
+        # usually has from_id = joiner in many chats. We'll fallback to that.
+        from_id = getattr(msg, "from_id", None)
+        uid = getattr(from_id, "user_id", None)
+        return [int(uid)] if uid else []
+    return []
+
 def _internal_id_from_peer(chat_id: int) -> str:
     s = str(chat_id)
     if s.startswith("-100"):
@@ -545,7 +561,8 @@ async def _is_user_still_in_chat_via_common_chats(client: TelegramClient, user_i
         print(f"   ⏳ FloodWait in common chats check: sleeping {e.seconds}s")
         await asyncio.sleep(e.seconds)
         return None
-    except Exception:
+    except Exception as e:
+        print('E-userfind', e)
         return None
 
 async def _send_saved_message_reminder_in_xm(client: TelegramClient, text: str):
@@ -577,6 +594,135 @@ async def _send_saved_message_reminder_in_xm(client: TelegramClient, text: str):
             print(f"❌ Failed to schedule Saved Messages reminder: {e2}")
     except Exception as e:
         print(f"❌ Failed to schedule Saved Messages reminder: {e}")
+
+def _is_long_time_ago_status(user) -> bool:
+    st = getattr(user, "status", None)
+    # In Telethon/MTProto, "last seen a long time ago" corresponds to UserStatusEmpty.
+    return st is not None and st.__class__.__name__ == "UserStatusEmpty"
+    
+async def _try_resolve_user_entity(
+    client: TelegramClient,
+    user_id: int,
+    username: Optional[str] = None,
+):
+    """
+    Try get_entity(user_id) first, then get_entity(username) if provided.
+    Returns (user_entity_or_None, how_string)
+    """
+    # 1) by id
+    try:
+        u = await client.get_entity(user_id)
+        return u, "id"
+    except Exception as e_id:
+        # 2) by username (if present)
+        if username:
+            ustr = username.strip()
+            if ustr:
+                if not ustr.startswith("@"):
+                    ustr = "@" + ustr
+                try:
+                    u = await client.get_entity(ustr)
+                    return u, f"username:{ustr}"
+                except Exception:
+                    pass
+        return None, f"fail:{e_id!r}"
+        
+async def _recent_participants_contains_user(
+    client: TelegramClient,
+    chat_entity,
+    target_user_id: int,
+    limit: int = 100,
+) -> Optional[bool]:
+    """
+    One API call: recent participants. Works for Channels/Megagroups (not basic Chats).
+    Returns True/False/None (None on unsupported/error).
+    """
+    try:
+        res = await client(functions.channels.GetParticipantsRequest(
+            channel=chat_entity,
+            filter=ChannelParticipantsRecent(),
+            offset=0,
+            limit=limit,
+            hash=0
+        ))
+        for u in (res.users or []):
+            if getattr(u, "id", None) == target_user_id:
+                return True
+        return False
+    except FloodWaitError as e:
+        print(f"   ⏳ FloodWait in recent participants: sleeping {e.seconds}s")
+        await asyncio.sleep(e.seconds)
+        return None
+    except Exception as e:
+        # Often "CHAT_ADMIN_REQUIRED" or "CHANNEL_INVALID" or "not a channel"
+        print(f"   ℹ️ recent participants check unavailable: {e}")
+        return None
+
+async def _verify_user_presence_stepped(
+    client: TelegramClient,
+    chat_entity,
+    chat_id: int,
+    user_id: int,
+    *,
+    username: Optional[str] = None,
+    recent_limit: int = 100,
+) -> tuple[Optional[bool], str]:
+
+    u, how = await _try_resolve_user_entity(client, user_id, username=username)
+
+    if u is None:
+        # Can't resolve entity -> go straight to recent participants
+        if chat_entity is not None:
+            rp = await _recent_participants_contains_user(client, chat_entity, user_id, limit=recent_limit)
+            if rp is True:
+                return True, f"resolve_failed:{how} -> recent_participants:yes"
+            if rp is False:
+                return False, f"resolve_failed:{how} -> recent_participants:no"
+        return None, f"resolve_failed:{how} -> recent_participants:unavailable"
+
+    # ✅ Your requested behavior: if it looks "blocked" (long time ago), don't bother
+    # waiting for a “status change”; jump to recent participants immediately.
+    if _is_long_time_ago_status(u):
+        if chat_entity is not None:
+            rp = await _recent_participants_contains_user(client, chat_entity, user_id, limit=recent_limit)
+            if rp is True:
+                return True, f"status:long_ago ({how}) -> recent_participants:yes"
+            if rp is False:
+                return False, f"status:long_ago ({how}) -> recent_participants:no"
+            return None, f"status:long_ago ({how}) -> recent_participants:unavailable"
+        return None, f"status:long_ago ({how}) -> no_chat_entity"
+
+    # Otherwise try common chats (cheap)
+    try:
+        res = await client(functions.messages.GetCommonChatsRequest(
+            user_id=u,
+            max_id=0,
+            limit=100
+        ))
+        internal = int(_internal_id_from_peer(chat_id))
+        for ch in (res.chats or []):
+            cid = getattr(ch, "id", None)
+            if cid is None:
+                continue
+            if cid == internal or cid == chat_id:
+                return True, f"common_chats:yes ({how})"
+        return False, f"common_chats:no ({how})"
+
+    except FloodWaitError as e:
+        print(f"   ⏳ FloodWait in common chats check: sleeping {e.seconds}s")
+        await asyncio.sleep(e.seconds)
+        return None, f"common_chats:floodwait ({how})"
+
+    except Exception as e:
+        # If common chats fails (including access_hash/input entity weirdness), fall back
+        if chat_entity is not None:
+            rp = await _recent_participants_contains_user(client, chat_entity, user_id, limit=recent_limit)
+            if rp is True:
+                return True, f"common_chats:error ({how}) {e!r} -> recent_participants:yes"
+            if rp is False:
+                return False, f"common_chats:error ({how}) {e!r} -> recent_participants:no"
+            return None, f"common_chats:error ({how}) {e!r} -> recent_participants:unavailable"
+        return None, f"common_chats:error ({how}) {e!r}"
 
 # --- Overwatch duplicate detection (mode 3) ---
 DUPLICATE_WINDOW_SECONDS = 10 * 60   # 10 minutes
@@ -1061,7 +1207,26 @@ async def overwatch_mode(
         except Exception:
             return
 
-        still = await _is_user_still_in_chat_via_common_chats(client, uid_int, chat_id)
+        # ✅ pull current scammer_map from shared state (it can refresh hourly)
+        async with state_lock:
+            scammer_map_now = dict(state.get("scammer_map", {}))
+
+        username = None
+        info = scammer_map_now.get(uid_str, {})
+        u = (info.get("username") or "").strip()
+        if u and u.lower() not in ("none", "deleted"):
+            username = u
+
+        still, why = await _verify_user_presence_stepped(
+            client,
+            chat_entity,
+            chat_id,
+            uid_int,
+            username=username,
+            recent_limit=200,
+        )
+        print(f"   🔎 verify detail: {why}")
+
         topic_line = f"• Scammer topic: {scammer_topic}\n" if scammer_topic else ""
 
         if still is True:
@@ -1080,13 +1245,14 @@ async def overwatch_mode(
 
         else:
             text = (
-                f"🚨 **Scammer joined chat**\n"
+                f"🚨 **Scammer joined chat (verify inconclusive)**\n"
                 f"• Chat: **{chat_title}**\n"
                 f"• Chat link: {chat_link}\n"
                 f"• Scammer: {scammer_display} (id `{uid_str}`)\n"
                 f"{topic_line}"
+                f"• Verify: {why}"
             ).rstrip()
-            print(f"ℹ️ Overwatch verify: inconclusive (but likely in) for '{chat_title}': {scammer_display} ({uid_str})")
+            print(f"ℹ️ Overwatch verify: inconclusive for '{chat_title}': {scammer_display} ({uid_str}) ({why})")
             await notify("verify", chat_entity, chat_id, uid_str, "unknown", text)
             
     async def _record_own_group_alert(chat_id: int, sent_msg, uids: Set[str]):
@@ -1211,6 +1377,51 @@ async def overwatch_mode(
 
         # NEW: duplicate watcher (mode 3)
         await _handle_possible_duplicate_alert(event, chat_id)
+        
+        # ✅ NEW: catch "invited/added/joined" service messages here
+        action_uids = _extract_action_user_ids(event.message)
+        if action_uids:
+            # Only resolve chat entity once
+            try:
+                chat_entity = await event.get_chat()
+            except Exception:
+                chat_entity = None
+
+            chat_title = getattr(chat_entity, "title", None) or "(unknown chat)"
+            chat_link = _chat_link(chat_entity, chat_id)
+
+            # Check each user that was added (can be multiple)
+            for auid in action_uids:
+                auid_str = str(auid)
+                if auid_str not in scammer_ids_local:
+                    continue
+
+                info = scammer_map_local.get(auid_str, {})
+                scammer_display = scammer_display_name_from_v2(info) if info else auid_str
+                scammer_topic = topic_link_for_scammer(info) if info else None
+                topic_line = f"• Scammer topic: {scammer_topic}\n" if scammer_topic else ""
+
+                text = (
+                    f"🚨 **Scammer invited/added detected**\n"
+                    f"• Chat: **{chat_title}** (`{chat_id}`)\n"
+                    f"• Chat link: {chat_link}\n"
+                    f"• Scammer: {scammer_display} (id `{auid_str}`)\n"
+                    f"{topic_line}"
+                ).rstrip()
+
+                print(f"🚨 Overwatch: scammer added/invited in '{chat_title}': {scammer_display} ({auid_str})")
+
+                # Use a stable extra_key so repeated identical service messages dedupe for 30s
+                await notify("joinmsg", chat_entity, chat_id, auid_str, str(event.message.id), text)
+
+                # (Optional) you can also re-use your delayed verification like ChatAction does:
+                # asyncio.create_task(delayed_join_verify(
+                #     chat_entity, chat_id, chat_title, chat_link, auid_str, scammer_display, scammer_topic
+                # ))
+
+            # IMPORTANT: prevent falling through and treating the service message as "scammer message detected"
+            return
+
 
         sender = await event.get_sender()
         if not sender:

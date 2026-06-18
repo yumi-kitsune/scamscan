@@ -1,7 +1,7 @@
 # /// script
 # dependencies = ["requests", "telethon"]
 # ///
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 __force__ = False
 ## Version info. Force should force existing clients to exit.
 
@@ -65,7 +65,13 @@ def setup_api_credentials():
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
             if 'api_id' in config and 'api_hash' in config:
-                return config['api_id'], config['api_hash']
+                validate_fail = 0
+                validate_fail += _validate_api_id(config['api_id'])
+                validate_fail += _validate_api_hash(config['api_hash'])
+                if not validate_fail:
+                    return config['api_id'], config['api_hash']
+                else:
+                    print("Could not read credentials from provided file")
 
     print("Let's set up your Telegram API credentials.\n")
     print("1 Go to https://my.telegram.org/auth?to=apps")
@@ -74,15 +80,56 @@ def setup_api_credentials():
     print("4 Create a new app (any name is fine).")
     print("5 Copy your 'API ID' and 'API Hash' below.\n")
 
-    api_id = input("Enter your API ID: ").strip()
-    api_hash = input("Enter your API Hash: ").strip()
+    while True:
+        api_id = input("Enter your API ID: ").strip()
+        api_hash = input("Enter your API Hash: ").strip()
+        validate_fail = 0
+        validate_fail += _validate_api_id(api_id)
+        validate_fail += _validate_api_hash(api_hash)
+        if not validate_fail:
+            break
+        
 
     with open(CONFIG_FILE, 'w') as f:
         json.dump({'api_id': api_id, 'api_hash': api_hash}, f)
 
     print("✅ API credentials saved to 'config.json'. Next time this will auto-load!\n")
-    print("Enter your phone number in the format of +12345678910\n")
+    print("Enter your phone number in the format of +12345678910 if prompted\n")
     return api_id, api_hash
+
+
+def _validate_api_id(api_id):
+    """
+    Returns:
+      0 - No error
+      1 - Error
+    """
+    try:
+        if api_id.isdigit() and int(api_id) > 0:
+            return 0
+        else:
+            print("API ID needs to be a number larger than zero")
+            return 1
+    except:
+        print("API ID could not be parsed")
+        return 1
+
+
+def _validate_api_hash(api_hash):
+    """
+    Returns:
+      0 - No error
+      1 - Error
+    """
+    try:
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+            print("API Hash must be exactly 32 hexadecimal characters")
+            return 1
+        else:
+            return 0
+    except:
+        print("API Hash could not be parsed")
+        return 1
 
 # --- Unified scammer data loader (v2) ---
 def load_scammer_data_v2(api_url: str = SCAMMER_API_V2) -> Tuple[Dict[str, Dict[str, Any]], Set[str]]:

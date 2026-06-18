@@ -1,5 +1,5 @@
-# /// script                                                                    
-# dependencies = ["requests", "telethon"]                                       
+# /// script
+# dependencies = ["requests", "telethon"]
 # ///
 __version__ = "0.3.7"
 __force__ = False

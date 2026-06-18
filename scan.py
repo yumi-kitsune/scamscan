@@ -1,4 +1,7 @@
-__version__ = "0.3.6"
+# /// script                                                                    
+# dependencies = ["requests", "telethon"]                                       
+# ///
+__version__ = "0.3.7"
 __force__ = False
 ## Version info. Force should force existing clients to exit.
 

@@ -1,0 +1,8 @@
+[project]
+name = "scamscan"
+version = "0.3.8"
+dependencies = ["requests", "telethon"]
+requires-python = ">= 3.8"
+
+[project.scripts]
+scamscan = "scan:run_main"

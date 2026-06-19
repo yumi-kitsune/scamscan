@@ -94,6 +94,17 @@ Telethon session file:
 
 ---
 
+### Docker
+
+This script can be run in a Docker image:
+
+```bash
+docker build -t scamscan .
+docker run -it scamscan
+```
+
+---
+
 ## Usage
 
 When launched, the script prompts you to choose a function:

@@ -1676,5 +1676,8 @@ async def main():
     await client.disconnect()
     input("\n✅ Done! Press Enter to exit...")
 
-if __name__ == '__main__':
+def run_main():
     asyncio.run(main())
+
+if __name__ == '__main__':
+    run_main()
